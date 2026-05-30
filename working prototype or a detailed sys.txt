@@ -1,0 +1,13 @@
+working prototype or a detailed system design 
+ 
+mock‑up
+ 
+A technical architecture diagram
+
+
+A live demonstration of your system (or a walkthrough of the design).
+
+A hardware extension to the Tracy wearable (e.g., adding air quality sensing or fall detection), even if simulated.
+
+ What public health decision can’t be made today, but could be made if you process this data in a new way?
+

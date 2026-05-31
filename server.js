@@ -1,25 +1,20 @@
-require('dotenv').config();
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const redis = require('redis');
-const { nanoid } = require('nanoid');
 const cors = require('cors');
-
-const app = express();
-const PORT = process.env.PORT || 5000;
-
 const fs = require('fs');
 const path = require('path');
 
-// Ensure the 'db' directory exists before SQLite initializes
+const app = express();
+
+app.use(cors());
+app.use(express.json());
+
+// Ensure the 'db' directory exists before SQLite initializes (Crucial for Render)
 const dbDir = path.join(__dirname, 'db');
 if (!fs.existsSync(dbDir)){
     fs.mkdirSync(dbDir);
 }
-
-// Middleware
-app.use(cors());
-app.use(express.json());
 
 // 1. Initialize SQLite Database
 const db = new sqlite3.Database('./db/database.sqlite', (err) => {
@@ -29,71 +24,124 @@ const db = new sqlite3.Database('./db/database.sqlite', (err) => {
 
 // Create URLs table if it doesn't exist
 db.run(`
-    CREATE TABLE IF NOT EXISTS urls (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        longUrl TEXT NOT NULL,
-        shortCode TEXT UNIQUE NOT NULL,
-        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
+  CREATE TABLE IF NOT EXISTS urls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    longUrl TEXT NOT NULL,
+    shortCode TEXT UNIQUE NOT NULL,
+    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
+// Create Clicks table for analytics tracking
+db.run(`
+  CREATE TABLE IF NOT EXISTS clicks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shortCode TEXT NOT NULL,
+    clickedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(shortCode) REFERENCES urls(shortCode)
+  )
 `);
 
 // 2. Initialize Redis Client
-const redisClient = redis.createClient({ url: process.env.REDIS_URL });
+const redisClient = redis.createClient({ url: process.env.REDIS_URL || 'redis://localhost:6379' });
 redisClient.on('error', (err) => console.error('Redis Client Error', err));
 redisClient.connect().then(() => console.log('Connected to Redis Cache.'));
+
 
 // 3. API Endpoints
 
 // Endpoint to shorten a URL
 app.post('/api/shorten', async (req, res) => {
     const { longUrl } = req.body;
-    if (!longUrl) return res.status(400).json({ error: 'URL is required' });
+    if (!longUrl) {
+        return res.status(400).json({ error: 'longUrl is required' });
+    }
 
-    const shortCode = nanoid(7); // Generates a unique 7-character string
+    // Generate a random 7-character short code
+    const crypto = require('crypto');
+    const shortCode = crypto.randomBytes(4).toString('hex').slice(0, 7);
 
-    // Save to SQLite
-    const stmt = db.prepare('INSERT INTO urls (longUrl, shortCode) VALUES (?, ?)');
-    stmt.run(longUrl, shortCode, async function (err) {
+    db.run('INSERT INTO urls (longUrl, shortCode) VALUES (?, ?)', [longUrl, shortCode], async function(err) {
         if (err) {
-            return res.status(500).json({ error: 'Database error occurred' });
+            return res.status(500).json({ error: 'Database insertion error' });
         }
 
-        // Cache the mapping in Redis for fast redirection later (Expires in 24 hours)
-        await redisClient.set(shortCode, longUrl, { EX: 86400 });
+        // Cache the new link in Redis
+        await redisClient.set(shortCode, longUrl);
 
-        const shortUrl = `${req.protocol}://${req.get('host')}/${shortCode}`;
-        res.status(201).json({ longUrl, shortCode, shortUrl });
+        const baseUrl = process.env.PORT ? `https://${req.get('host')}` : `http://localhost:${PORT}`;
+        res.status(201).json({
+            shortCode,
+            shortUrl: `${baseUrl}/${shortCode}`
+        });
     });
-    stmt.finalize();
 });
 
-// Endpoint to redirect short URL to long URL
+// Endpoint to fetch analytics metrics for a short code
+app.get('/api/analytics/:shortCode', (req, res) => {
+    const { shortCode } = req.params;
+  
+    const urlQuery = `SELECT longUrl, createdAt FROM urls WHERE shortCode = ?`;
+    const clickQuery = `SELECT clickedAt FROM clicks WHERE shortCode = ? ORDER BY clickedAt DESC`;
+  
+    db.get(urlQuery, [shortCode], (err, urlRow) => {
+        if (err || !urlRow) {
+            return res.status(404).json({ error: 'Short URL tracking data not found' });
+        }
+  
+        db.all(clickQuery, [shortCode], (err, clickRows) => {
+            if (err) {
+                return res.status(500).json({ error: 'Failed to compile click logs' });
+            }
+  
+            return res.json({
+                shortCode,
+                longUrl: urlRow.longUrl,
+                createdOn: urlRow.createdAt,
+                totalClicks: clickRows.length,
+                clickHistory: clickRows.map(row => row.clickedAt)
+            });
+        });
+    });
+});
+
+// Incoming redirection redirection endpoint (Must be at the bottom)
 app.get('/:shortCode', async (req, res) => {
     const { shortCode } = req.params;
-
+  
     try {
-        // Step A: Check Redis Cache first
+        // 1. Try fetching from Redis cache
         const cachedUrl = await redisClient.get(shortCode);
+      
         if (cachedUrl) {
+            // Asynchronous log to SQLite in background
+            db.run('INSERT INTO clicks (shortCode) VALUES (?)', [shortCode]);
             return res.redirect(cachedUrl);
         }
-
-        // Step B: Cache miss? Check SQLite Database
-        db.get('SELECT longUrl FROM urls WHERE shortCode = ?', [shortCode], async (err, row) => {
+  
+        // 2. Fallback to SQLite database
+        db.get('SELECT longUrl FROM urls WHERE shortCode = ?', [shortCode], (err, row) => {
             if (err || !row) {
-                return res.status(404).send('URL not found');
+                return res.status(404).send('URL Not Found');
             }
-
-            // Step C: Re-populate Redis cache for next time, then redirect
-            await redisClient.set(shortCode, row.longUrl, { EX: 86400 });
+  
+            // Log click to SQLite
+            db.run('INSERT INTO clicks (shortCode) VALUES (?)', [shortCode]);
+  
+            // Seed cache for future visitors
+            redisClient.set(shortCode, row.longUrl);
+  
             return res.redirect(row.longUrl);
         });
-
+  
     } catch (error) {
-        res.status(500).send('Server error');
+        console.error('Redirection routing error:', error);
+        res.status(500).send('Internal Server Error');
     }
 });
 
+// Start server dynamically based on cloud env environment configuration
+const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`Server running on port ${PORT}`);
 });
